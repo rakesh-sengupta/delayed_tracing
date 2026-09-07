@@ -8,7 +8,6 @@ agency-tracing/
 ├── index.html              the experiment (jsPsych 7, single file)
 ├── google_apps_script.gs   the receiver that writes data into Drive (lives on script.google.com, not in the repo)
 ├── analyze_tracing.py      turns the saved JSON into a stretch-level table + fits the pre-registered models
-├── protocol.pdf            the study protocol
 ├── .nojekyll               tells GitHub Pages to serve the files as-is
 └── README.md               this file
 ```
