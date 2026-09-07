@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Circle tracing study</title>
+<!--
+  Delayed visual feedback and the sense of agency  --  jsPsych 7 implementation
+  Computational Cognition Laboratory, Krea University.  Protocol v1.0 (see protocol.pdf).
+
+  HOW TO RUN  (full instructions in README.md)
+    * Hosted on GitHub Pages:  https://<user>.github.io/<repo>/?id=P01
+    * Data is POSTed to a Google Apps Script web app that writes it into a Drive folder
+      (paste its URL into CONFIG.save_url). It is saved at every block break and at the
+      end, so a drop-out still leaves a partial file. If the drive cannot be reached, the
+      data is downloaded to the computer instead and the completion screen says so.
+    * URL switches:   ?id=P01     pre-fills the participant ID
+                      ?save=off   local download only  (testing; never for participants)
+                      ?dev=1      3-second stretches, 4 stretches, quick end-to-end check
+    * Use a MOUSE, not a trackpad. Full screen is requested automatically.
+
+  WHAT IT DOES
+    Participants trace a ring with the mouse for 20-s stretches. The OS cursor is hidden;
+    a dot follows the hand with a lag of 0 / 60 / 120 / 180 / 300 ms (fixed within a stretch).
+    After every stretch they rate how much it felt like THEY moved the dot (0-100).
+    A subset of 0-ms stretches contain a brief colour flash of the dot (attention control).
+    Hand and lagged-dot trajectories are logged at frame rate for the complexity-shadow analyses.
+-->
+<script src="https://unpkg.com/jspsych@7"></script>
+<script src="https://unpkg.com/@jspsych/plugin-html-button-response@1"></script>
+<script src="https://unpkg.com/@jspsych/plugin-html-slider-response@1"></script>
+<script src="https://unpkg.com/@jspsych/plugin-survey-text@1"></script>
+<script src="https://unpkg.com/@jspsych/plugin-fullscreen@1"></script>
+<link rel="stylesheet" href="https://unpkg.com/jspsych@7/css/jspsych.css">
+<style>
+  /* Deliberately neutral: nothing on screen should compete with the dot. */
+  html, body { background: #f4f4f4; }
+  .jspsych-content { max-width: 720px; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+                     color: #222; line-height: 1.5; font-size: 18px; }
+  .trace-wrap { position: relative; display: inline-block; cursor: none; }
+  .trace-wrap canvas { display: block; background: #fafafa; border: 1px solid #ddd; cursor: none; }
+  .trace-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                   font-size: 22px; color: #444; background: rgba(250,250,250,0.85); pointer-events: none; }
+  .trace-timer { position: absolute; top: 8px; right: 12px; font-size: 14px; color: #999; pointer-events: none; }
+  .jspsych-html-slider-response-container { width: 520px !important; }
+  p.small { font-size: 15px; color: #666; }
+  .done { max-width: 640px; margin: 3em auto; font-family: system-ui, sans-serif; font-size: 20px; color: #222; line-height: 1.5; }
+</style>
+</head>
+<body></body>
+<script>
+/* =========================================================================
+   CONFIG  -- edit here
+   ========================================================================= */
+const URLP = new URLSearchParams(window.location.search);
+const DEV  = URLP.get('dev') === '1';
+
+const CONFIG = {
+  delays_ms:        [0, 60, 120, 180, 300],   // lag levels (fixed within a stretch)
+  reps_per_delay:   6,                        // 5 x 6 = 30 experimental stretches
+  n_flash_control:  6,                        // extra 0-ms stretches with a dot-colour flash
+  stretch_ms:       DEV ? 3000 : 20000,       // duration of one tracing stretch
+  n_blocks:         3,                        // breaks are inserted between blocks
+  practice:         [ {delay:0, flash:false}, {delay:300, flash:false}, {delay:120, flash:false} ],
+  canvas_px:        600,
+  ring_radius_px:   180,
+  dot_radius_px:    8,
+  flash_ms:         300,                      // attention control: dot turns red for this long
+  flash_window_ms:  [5000, 15000],            // ...at a random moment in this window
+  slider_prompt:    'How much did it feel like <b>you</b> were moving the dot?',
+  slider_labels:    ['Not at all me', 'Completely me'],
+
+  // ---- data saving ---------------------------------------------------------
+  // Paste the Web App URL from google_apps_script.gs (Deploy -> Web app -> URL ending in /exec)
+  save_url:         'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE',
+  save:             URLP.get('save') !== 'off',   // ?save=off -> local download only
+  study_tag:        'agency_tracing_v1',           // goes into every filename
+};
+if (DEV) { CONFIG.reps_per_delay = 1; CONFIG.n_flash_control = 1; CONFIG.n_blocks = 2; CONFIG.practice = [{delay:0, flash:false}]; }
+
+/* =========================================================================
+   DATA SAVING  (Google Drive via Apps Script, with local fallback)
+   ========================================================================= */
+const SESSION = { pid: 'unknown', stamp: null, saved_ok: false, last_error: null };
+
+function sessionStamp() {
+  const d = new Date(), z = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${z(d.getMonth()+1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`;
+}
+function baseName() {
+  const safe = String(SESSION.pid).replace(/[^A-Za-z0-9_-]/g, '_');
+  return `${CONFIG.study_tag}_${safe}_${SESSION.stamp || sessionStamp()}`;
+}
+function summaryCollection() {
+  return jsPsych.data.get()
+    .filterCustom(d => d.trial_type === 'circle-trace' || d.trial_type === 'html-slider-response')
+    .ignore(['traj']);
+}
+function buildPayload(final) {
+  return {
+    filename: baseName(),          // the server writes <filename>.json and <filename>_summary.csv
+    pid: SESSION.pid,
+    final: !!final,                // false = partial save at a block break
+    json: jsPsych.data.get().json(),
+    csv: summaryCollection().csv(),
+  };
+}
+// POST the data so far. Tries a CORS request first (so the server's reply can be read);
+// if that fails, fires a write-only no-cors request and reports "unconfirmed".
+async function saveToDrive(final) {
+  if (!CONFIG.save || !CONFIG.save_url || CONFIG.save_url.startsWith('PASTE')) return 'off';
+  const body = JSON.stringify(buildPayload(final));
+  const opts = { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body };
+  try {
+    const r = await fetch(CONFIG.save_url, { ...opts, mode: 'cors', redirect: 'follow' });
+    const txt = await r.text();
+    if (/"status"\s*:\s*"ok"/.test(txt)) { SESSION.saved_ok = true; return 'ok'; }
+    SESSION.last_error = 'server replied: ' + txt.slice(0, 120);
+  } catch (e) { SESSION.last_error = String(e); }
+  try {
+    await fetch(CONFIG.save_url, { ...opts, mode: 'no-cors' });
+    return 'unconfirmed';
+  } catch (e) { SESSION.last_error = String(e); return 'failed'; }
+}
+function downloadLocal() {
+  jsPsych.data.get().localSave('json', baseName() + '.json');
+  summaryCollection().localSave('csv', baseName() + '_summary.csv');
+}
+
+/* =========================================================================
+   CUSTOM PLUGIN: circle-trace
+   Tracks the mouse, draws a dot at the hand position from (now - delay_ms),
+   logs both trajectories every animation frame.
+   ========================================================================= */
+const CircleTracePlugin = (function () {
+  const { ParameterType } = jsPsychModule;
+
+  class CircleTracePlugin {
+    static info = {
+      name: 'circle-trace',
+      parameters: {
+        delay_ms:     { type: ParameterType.INT,  default: 0 },
+        duration_ms:  { type: ParameterType.INT,  default: 20000 },
+        flash:        { type: ParameterType.BOOL, default: false },
+        flash_ms:     { type: ParameterType.INT,  default: 300 },
+        flash_window: { type: ParameterType.INT,  default: [5000, 15000], array: true },
+        canvas_px:    { type: ParameterType.INT,  default: 600 },
+        radius_px:    { type: ParameterType.INT,  default: 180 },
+        dot_px:       { type: ParameterType.INT,  default: 8 },
+      },
+    };
+
+    constructor(jsPsych) { this.jsPsych = jsPsych; }
+
+    trial(display_element, trial) {
+      const S = trial.canvas_px, R = trial.radius_px, cx = S / 2, cy = S / 2;
+
+      display_element.innerHTML = `
+        <div class="trace-wrap" id="trace-wrap">
+          <canvas id="trace-canvas" width="${S}" height="${S}"></canvas>
+          <div class="trace-timer" id="trace-timer"></div>
+          <div class="trace-overlay" id="trace-overlay">Move the mouse onto the ring to begin</div>
+        </div>`;
+      const canvas  = display_element.querySelector('#trace-canvas');
+      const overlay = display_element.querySelector('#trace-overlay');
+      const timerEl = display_element.querySelector('#trace-timer');
+      const ctx     = canvas.getContext('2d');
+
+      // ---- state ------------------------------------------------------------
+      const buf = [];             // {t, x, y} hand samples (ms since trial start)
+      let started = false, t0 = null, rafId = null;
+      let flashAt = null, flashOn = false;
+      if (trial.flash) { const [a, b] = trial.flash_window; flashAt = a + Math.random() * (b - a); }
+      const log = { t: [], hx: [], hy: [], cx: [], cy: [] };
+      const now = () => performance.now() - t0;
+
+      // ---- hand tracking ----------------------------------------------------
+      const onMove = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        if (!started) {
+          if (x < 0 || y < 0 || x > S || y > S) return;   // must begin on the canvas
+          started = true; t0 = performance.now();
+          overlay.style.display = 'none';
+          buf.push({ t: 0, x, y });
+          rafId = requestAnimationFrame(frame);
+          return;
+        }
+        buf.push({ t: now(), x, y });
+      };
+      window.addEventListener('mousemove', onMove);
+
+      // hand position at an arbitrary time tau (linear interpolation)
+      const handAt = (tau) => {
+        if (buf.length === 0) return null;
+        if (tau <= buf[0].t) return { x: buf[0].x, y: buf[0].y };
+        const last = buf[buf.length - 1];
+        if (tau >= last.t) return { x: last.x, y: last.y };
+        let lo = 0, hi = buf.length - 1;
+        while (hi - lo > 1) { const mid = (lo + hi) >> 1; (buf[mid].t <= tau) ? (lo = mid) : (hi = mid); }
+        const a = buf[lo], b = buf[hi], w = (tau - a.t) / Math.max(1e-6, b.t - a.t);
+        return { x: a.x + w * (b.x - a.x), y: a.y + w * (b.y - a.y) };
+      };
+
+      // ---- drawing ----------------------------------------------------------
+      const draw = (dot, red) => {
+        ctx.clearRect(0, 0, S, S);
+        ctx.lineWidth = 12; ctx.strokeStyle = '#d9d9d9';
+        ctx.beginPath(); ctx.arc(cx, cy, R, 0, 2 * Math.PI); ctx.stroke();
+        ctx.fillStyle = '#bbb'; ctx.beginPath(); ctx.arc(cx, cy, 3, 0, 2 * Math.PI); ctx.fill();
+        if (dot) {
+          ctx.fillStyle = red ? '#d62728' : '#1f77b4';
+          ctx.beginPath(); ctx.arc(dot.x, dot.y, trial.dot_px, 0, 2 * Math.PI); ctx.fill();
+        }
+      };
+      draw(null, false);
+
+      // ---- frame loop -------------------------------------------------------
+      const frame = () => {
+        const t = now();
+        if (t >= trial.duration_ms) { finish(); return; }
+        const hand = handAt(t);
+        const dot  = handAt(t - trial.delay_ms);
+        if (flashAt !== null) flashOn = (t >= flashAt && t < flashAt + trial.flash_ms);
+        draw(dot, flashOn);
+        timerEl.textContent = `${Math.ceil((trial.duration_ms - t) / 1000)}`;
+        if (hand && dot) {
+          log.t.push(Math.round(t * 10) / 10);
+          log.hx.push(Math.round(hand.x * 10) / 10); log.hy.push(Math.round(hand.y * 10) / 10);
+          log.cx.push(Math.round(dot.x * 10) / 10);  log.cy.push(Math.round(dot.y * 10) / 10);
+        }
+        const keepFrom = t - trial.delay_ms - 200;          // drop samples no longer needed
+        while (buf.length > 2 && buf[1].t < keepFrom) buf.shift();
+        rafId = requestAnimationFrame(frame);
+      };
+
+      // ---- summary + finish -------------------------------------------------
+      const finish = () => {
+        cancelAnimationFrame(rafId);
+        window.removeEventListener('mousemove', onMove);
+        const n = log.t.length;
+        let errSum = 0, prev = null, unwrapped = 0;
+        for (let i = 0; i < n; i++) {
+          const dx = log.hx[i] - cx, dy = log.hy[i] - cy;
+          errSum += Math.abs(Math.hypot(dx, dy) - R);
+          const a = Math.atan2(dy, dx);
+          if (prev !== null) { let d = a - prev; if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; unwrapped += d; }
+          prev = a;
+        }
+        const data = {
+          delay_ms: trial.delay_ms,
+          flash: trial.flash,
+          flash_at_ms: flashAt === null ? null : Math.round(flashAt),
+          duration_ms: trial.duration_ms,
+          n_samples: n,
+          mean_frame_ms: n > 1 ? Math.round(((log.t[n - 1] - log.t[0]) / (n - 1)) * 100) / 100 : null,
+          mean_radial_error_px: n ? Math.round((errSum / n) * 100) / 100 : null,
+          revolutions: Math.round((Math.abs(unwrapped) / (2 * Math.PI)) * 100) / 100,
+          traj: log,                      // full trajectories (hand + lagged dot)
+        };
+        display_element.innerHTML = '';
+        this.jsPsych.finishTrial(data);
+      };
+    }
+  }
+  return CircleTracePlugin;
+})();
+
+/* =========================================================================
+   TIMELINE
+   ========================================================================= */
+const jsPsych = initJsPsych({
+  on_finish: async () => {
+    document.body.innerHTML = '<div class="done"><p>Saving your data&hellip;</p></div>';
+    const status = await saveToDrive(true);
+    let msg;
+    if (status === 'ok') {
+      msg = '<p><b>Thank you.</b> Your data has been saved. You can close this window.</p>';
+    } else if (status === 'off') {
+      downloadLocal();
+      msg = '<p><b>Thank you.</b> (Test mode: the data has been downloaded to this computer.)</p>';
+    } else {
+      downloadLocal();
+      msg = `<p><b>Thank you.</b></p>
+             <p>The data could not be confirmed as saved online, so it has been <b>downloaded to this
+             computer</b> (file starting <code>${baseName()}</code>). Please tell the researcher so they
+             can collect the file.</p>
+             <p class="small">status: ${status}${SESSION.last_error ? ' &mdash; ' + SESSION.last_error : ''}</p>`;
+    }
+    document.body.innerHTML = `<div class="done">${msg}
+      <p class="small"><a href="#" id="dl">Download a copy of the data</a></p></div>`;
+    document.getElementById('dl').addEventListener('click', e => { e.preventDefault(); downloadLocal(); });
+  },
+});
+
+const timeline = [];
+
+// participant ID (pre-filled from ?id=)
+timeline.push({
+  type: jsPsychSurveyText,
+  questions: [{ prompt: 'Participant ID', name: 'pid', required: true, columns: 20, value: URLP.get('id') || '' }],
+  button_label: 'Continue',
+  on_finish: (d) => {
+    SESSION.pid = d.response.pid; SESSION.stamp = sessionStamp();
+    jsPsych.data.addProperties({ pid: SESSION.pid, session: SESSION.stamp, study: CONFIG.study_tag });
+  },
+});
+
+timeline.push({ type: jsPsychFullscreen, fullscreen_mode: true,
+  message: '<p>The study will switch to full screen.</p>', button_label: 'Continue' });
+
+timeline.push({
+  type: jsPsychHtmlButtonResponse,
+  stimulus: `
+    <h2>Tracing a ring</h2>
+    <p>On each go you'll see a grey ring. Move the mouse to trace <b>around the ring</b> smoothly,
+       going round and round at a steady, comfortable pace, for about 20 seconds.</p>
+    <p>You won't see the usual mouse pointer. Instead a blue dot follows your hand.
+       Sometimes the dot follows closely; sometimes it lags behind. Just keep tracing.</p>
+    <p>After each go, you'll answer one question: how much it felt like <b>you</b> were moving the dot.
+       There are no right answers &mdash; go with your honest impression.</p>
+    <p class="small">Please use a mouse, not a trackpad. Sit comfortably; keep going at a steady pace even if the dot lags.</p>`,
+  choices: ['Start practice'],
+});
+
+// one stretch = trace + rating
+const stretch = (cond, phase, block) => ([
+  {
+    type: CircleTracePlugin,
+    delay_ms: cond.delay, flash: cond.flash,
+    duration_ms: CONFIG.stretch_ms, flash_ms: CONFIG.flash_ms, flash_window: CONFIG.flash_window_ms,
+    canvas_px: CONFIG.canvas_px, radius_px: CONFIG.ring_radius_px, dot_px: CONFIG.dot_radius_px,
+    data: { phase, block, condition_delay: cond.delay, condition_flash: cond.flash },
+  },
+  {
+    type: jsPsychHtmlSliderResponse,
+    stimulus: `<p style="margin-bottom:1.2em">${CONFIG.slider_prompt}</p>`,
+    labels: CONFIG.slider_labels, min: 0, max: 100, slider_start: 50, step: 1,
+    require_movement: true, button_label: 'Next',
+    data: { phase, block, condition_delay: cond.delay, condition_flash: cond.flash },
+  },
+]);
+
+// practice
+CONFIG.practice.forEach(c => timeline.push(...stretch(c, 'practice', 0)));
+timeline.push({ type: jsPsychHtmlButtonResponse,
+  stimulus: '<p>That was the practice. The main part works exactly the same way. There will be short breaks.</p>',
+  choices: ['Begin'] });
+
+// main conditions: 5 delays x reps, plus flash controls at 0 ms; shuffled; split into blocks
+let conds = [];
+CONFIG.delays_ms.forEach(d => { for (let i = 0; i < CONFIG.reps_per_delay; i++) conds.push({ delay: d, flash: false }); });
+for (let i = 0; i < CONFIG.n_flash_control; i++) conds.push({ delay: 0, flash: true });
+conds = jsPsych.randomization.shuffle(conds);
+const perBlock = Math.ceil(conds.length / CONFIG.n_blocks);
+conds.forEach((c, i) => {
+  const block = Math.floor(i / perBlock) + 1;
+  if (i > 0 && i % perBlock === 0) {
+    timeline.push({ type: jsPsychHtmlButtonResponse,
+      stimulus: `<p>Short break. Rest your hand for a moment.</p><p class="small">Block ${block} of ${CONFIG.n_blocks} is next.</p>`,
+      choices: ['Continue'],
+      on_start: () => { saveToDrive(false); } });   // partial save: a drop-out still leaves data
+  }
+  timeline.push(...stretch(c, 'main', block));
+});
+
+timeline.push({ type: jsPsychHtmlButtonResponse,
+  stimulus: `<p>Last question. Did you notice anything unusual about the dot during the study?</p>
+             <p class="small">(This helps us know what people noticed; there is no right answer.)</p>`,
+  choices: ['Yes, the dot lagged', 'Yes, the dot changed colour', 'Yes, both', 'Nothing unusual'],
+  data: { phase: 'debrief' } });
+
+jsPsych.run(timeline);
+</script>
+</html>
