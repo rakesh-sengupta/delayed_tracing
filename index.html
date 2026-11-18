@@ -6,6 +6,9 @@
 <!--
   Delayed visual feedback and the sense of agency  --  jsPsych 7 implementation
   Computational Cognition Laboratory, Krea University.  Protocol v1.0 (see protocol.pdf).
+  Task version v2 (study_tag agency_tracing_v2): adds a pacing demo, per-stretch tracing-quality
+  measures, pace/accuracy feedback (shown AFTER the rating), input-device and handedness questions,
+  and a two-question debrief. See CHANGELOG.md.
 
   HOW TO RUN  (full instructions in README.md)
     * Hosted on GitHub Pages:  https://<user>.github.io/<repo>/?id=P01
@@ -15,7 +18,7 @@
       data is downloaded to the computer instead and the completion screen says so.
     * URL switches:   ?id=P01     pre-fills the participant ID
                       ?save=off   local download only  (testing; never for participants)
-                      ?dev=1      3-second stretches, 4 stretches, quick end-to-end check
+                      ?dev=1      3-second stretches, 6 main stretches, quick end-to-end check
     * Use a MOUSE, not a trackpad. Full screen is requested automatically.
 
   WHAT IT DOES
@@ -69,13 +72,30 @@ const CONFIG = {
   slider_prompt:    'How much did it feel like <b>you</b> were moving the dot?',
   slider_labels:    ['Not at all me', 'Completely me'],
 
+  // ---- pacing and tracing quality (v2) ------------------------------------
+  // Pilot data showed one participant tracing at ~10 s per lap (so a 120-ms lag moved the dot
+  // only ~15 px) and another scribbling off the ring at >1 lap/s. v2 shows the target pace
+  // before practice and gives feedback after a stretch when tracing falls outside these limits.
+  pace_lap_s:       3,                        // instructed pace: about one lap every 3 s
+  pace_demo_ms:     9000,                     // length of the pacing demonstration
+  qc: {
+    min_laps_per_s: 0.15,                     // slower than ~1 lap / 6.7 s -> "a little faster"  (3 laps per 20 s)
+    max_laps_per_s: 0.75,                     // faster than ~1 lap / 1.3 s -> "a little slower"  (15 laps per 20 s)
+    ring_tol_px:    40,                       // hand counts as off the ring beyond R +/- this
+    max_off_ring:   0.25,                     // > 25% of frames off the ring -> "stay on the ring"
+    max_backward:   0.15,                     // > 15% of the path against the main direction -> "one direction"
+  },
+  feedback:         true,                     // pacing/accuracy feedback, shown AFTER the rating
+
   // ---- data saving ---------------------------------------------------------
   // Paste the Web App URL from google_apps_script.gs (Deploy -> Web app -> URL ending in /exec)
   save_url:         'https://script.google.com/macros/s/AKfycbzubpUd2_BUat8btQUgejGXg3tJoRKQy1cyL_GoO-vYEwAmSaTie7M0r75okx-ozlxA1Q/exec',
   save:             URLP.get('save') !== 'off',   // ?save=off -> local download only
-  study_tag:        'agency_tracing_v1',           // goes into every filename
+  study_tag:        'agency_tracing_v2',           // goes into every filename (v2 = this version)
 };
-if (DEV) { CONFIG.reps_per_delay = 1; CONFIG.n_flash_control = 1; CONFIG.n_blocks = 2; CONFIG.practice = [{delay:0, flash:false}]; }
+if (DEV) { CONFIG.reps_per_delay = 1; CONFIG.n_flash_control = 1; CONFIG.n_blocks = 2;
+           CONFIG.practice = [{delay:0, flash:false}]; CONFIG.flash_window_ms = [500, 2000];
+           CONFIG.pace_demo_ms = 3000; }
 
 /* =========================================================================
    DATA SAVING  (Google Drive via Apps Script, with local fallback)
@@ -146,6 +166,7 @@ const CircleTracePlugin = (function () {
         canvas_px:    { type: ParameterType.INT,  default: 600 },
         radius_px:    { type: ParameterType.INT,  default: 180 },
         dot_px:       { type: ParameterType.INT,  default: 8 },
+        ring_tol_px:  { type: ParameterType.INT,  default: 40 },
       },
     };
 
@@ -238,14 +259,23 @@ const CircleTracePlugin = (function () {
         cancelAnimationFrame(rafId);
         window.removeEventListener('mousemove', onMove);
         const n = log.t.length;
-        let errSum = 0, prev = null, unwrapped = 0;
+        let errSum = 0, prev = null, unwrapped = 0, offRing = 0, posPath = 0, negPath = 0;
         for (let i = 0; i < n; i++) {
           const dx = log.hx[i] - cx, dy = log.hy[i] - cy;
-          errSum += Math.abs(Math.hypot(dx, dy) - R);
+          const e = Math.abs(Math.hypot(dx, dy) - R);
+          errSum += e;
+          if (e > trial.ring_tol_px) offRing++;
           const a = Math.atan2(dy, dx);
-          if (prev !== null) { let d = a - prev; if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI; unwrapped += d; }
+          if (prev !== null) {
+            let d = a - prev; if (d > Math.PI) d -= 2 * Math.PI; if (d < -Math.PI) d += 2 * Math.PI;
+            unwrapped += d;
+            if (d > 0) posPath += d; else negPath -= d;
+          }
           prev = a;
         }
+        const durS = n > 1 ? (log.t[n - 1] - log.t[0]) / 1000 : 0;
+        const revs = Math.abs(unwrapped) / (2 * Math.PI);
+        const r2 = (x) => Math.round(x * 100) / 100, r3 = (x) => Math.round(x * 1000) / 1000;
         const data = {
           delay_ms: trial.delay_ms,
           flash: trial.flash,
@@ -254,7 +284,14 @@ const CircleTracePlugin = (function () {
           n_samples: n,
           mean_frame_ms: n > 1 ? Math.round(((log.t[n - 1] - log.t[0]) / (n - 1)) * 100) / 100 : null,
           mean_radial_error_px: n ? Math.round((errSum / n) * 100) / 100 : null,
-          revolutions: Math.round((Math.abs(unwrapped) / (2 * Math.PI)) * 100) / 100,
+          revolutions: r2(revs),
+          // ---- v2 tracing-quality measures ----
+          laps_per_s:    durS > 0 ? r3(revs / durS) : null,
+          off_ring_frac: n ? r3(offRing / n) : null,           // share of frames with |r - R| > ring_tol_px
+          backward_frac: (posPath + negPath) > 0 ? r3(Math.min(posPath, negPath) / (posPath + negPath)) : null,
+          direction:     unwrapped >= 0 ? 'cw' : 'ccw',        // screen coordinates (y points down)
+          ring_tol_px:   trial.ring_tol_px,
+          canvas_px:     S, ring_radius_px: R,                 // geometry, so the analysis never has to assume it
           traj: log,                      // full trajectories (hand + lagged dot)
         };
         display_element.innerHTML = '';
@@ -294,15 +331,45 @@ const jsPsych = initJsPsych({
 
 const timeline = [];
 
-// participant ID (pre-filled from ?id=)
+// participant ID (pre-filled from ?id=) + session/environment properties on every row
 timeline.push({
   type: jsPsychSurveyText,
   questions: [{ prompt: 'Participant ID', name: 'pid', required: true, columns: 20, value: URLP.get('id') || '' }],
   button_label: 'Continue',
   on_finish: (d) => {
     SESSION.pid = d.response.pid; SESSION.stamp = sessionStamp();
-    jsPsych.data.addProperties({ pid: SESSION.pid, session: SESSION.stamp, study: CONFIG.study_tag });
+    jsPsych.data.addProperties({
+      pid: SESSION.pid, session: SESSION.stamp, study: CONFIG.study_tag, dev: DEV,
+      screen_w: window.screen.width, screen_h: window.screen.height,
+      dpr: window.devicePixelRatio, user_agent: navigator.userAgent,
+    });
   },
+});
+
+// input device and handedness (v2): the analysis flags trackpad sessions
+timeline.push({
+  type: jsPsychHtmlButtonResponse,
+  stimulus: '<p>What are you using to move the pointer right now?</p>',
+  choices: ['Mouse', 'Trackpad / touchpad', 'Something else'],
+  data: { phase: 'setup', question: 'device' },
+  on_finish: (d) => { d.answer = ['mouse', 'trackpad', 'other'][d.response]; },
+});
+timeline.push({
+  timeline: [{
+    type: jsPsychHtmlButtonResponse,
+    stimulus: `<p>This task works much better with a <b>mouse</b>. If you can plug one in, please do it now.</p>`,
+    choices: ['I have switched to a mouse', 'I cannot, continue anyway'],
+    data: { phase: 'setup', question: 'device_switch' },
+    on_finish: (d) => { d.answer = d.response === 0 ? 'switched_to_mouse' : 'kept_trackpad'; },
+  }],
+  conditional_function: () => jsPsych.data.get().filter({ question: 'device' }).last(1).values()[0].response !== 0,
+});
+timeline.push({
+  type: jsPsychHtmlButtonResponse,
+  stimulus: '<p>Which hand are you using to move the mouse?</p>',
+  choices: ['Right', 'Left'],
+  data: { phase: 'setup', question: 'hand' },
+  on_finish: (d) => { d.answer = ['right', 'left'][d.response]; },
 });
 
 timeline.push({ type: jsPsychFullscreen, fullscreen_mode: true,
@@ -313,32 +380,94 @@ timeline.push({
   stimulus: `
     <h2>Tracing a ring</h2>
     <p>On each go you'll see a grey ring. Move the mouse to trace <b>around the ring</b> smoothly,
-       going round and round at a steady, comfortable pace, for about 20 seconds.</p>
+       going round and round <b>in one direction</b>, for about 20 seconds.</p>
     <p>You won't see the usual mouse pointer. Instead a blue dot follows your hand.
        Sometimes the dot follows closely; sometimes it lags behind. Just keep tracing.</p>
     <p>After each go, you'll answer one question: how much it felt like <b>you</b> were moving the dot.
        There are no right answers &mdash; go with your honest impression.</p>
     <p class="small">Please use a mouse, not a trackpad. Sit comfortably; keep going at a steady pace even if the dot lags.</p>`,
-  choices: ['Start practice'],
+  choices: ['Continue'],
 });
 
-// one stretch = trace + rating
-const stretch = (cond, phase, block) => ([
-  {
-    type: CircleTracePlugin,
-    delay_ms: cond.delay, flash: cond.flash,
-    duration_ms: CONFIG.stretch_ms, flash_ms: CONFIG.flash_ms, flash_window: CONFIG.flash_window_ms,
-    canvas_px: CONFIG.canvas_px, radius_px: CONFIG.ring_radius_px, dot_px: CONFIG.dot_radius_px,
-    data: { phase, block, condition_delay: cond.delay, condition_flash: cond.flash },
+// pacing demonstration (v2): a grey dot goes round the ring at the target pace
+let paceRaf = null;
+timeline.push({
+  type: jsPsychHtmlButtonResponse,
+  stimulus: `
+    <p><b>The pace.</b> Aim for about <b>one lap every ${CONFIG.pace_lap_s} seconds</b>, like the grey dot below,
+       and keep your hand <b>on the ring</b>.</p>
+    <canvas id="pace-canvas" width="${CONFIG.canvas_px}" height="${CONFIG.canvas_px}"
+            style="background:#fafafa;border:1px solid #ddd;max-width:100%"></canvas>`,
+  choices: ['Start practice'],
+  enable_button_after: CONFIG.pace_demo_ms,
+  data: { phase: 'pace_demo' },
+  on_load: () => {
+    const cv = document.getElementById('pace-canvas'), ctx = cv.getContext('2d');
+    const S = CONFIG.canvas_px, R = CONFIG.ring_radius_px, t0 = performance.now();
+    const step = () => {
+      const t = (performance.now() - t0) / 1000, a = -Math.PI / 2 + 2 * Math.PI * t / CONFIG.pace_lap_s;
+      ctx.clearRect(0, 0, S, S);
+      ctx.lineWidth = 12; ctx.strokeStyle = '#d9d9d9';
+      ctx.beginPath(); ctx.arc(S / 2, S / 2, R, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillStyle = '#8a8a8a';
+      ctx.beginPath(); ctx.arc(S / 2 + R * Math.cos(a), S / 2 + R * Math.sin(a), CONFIG.dot_radius_px, 0, 2 * Math.PI); ctx.fill();
+      paceRaf = requestAnimationFrame(step);
+    };
+    step();
   },
-  {
-    type: jsPsychHtmlSliderResponse,
-    stimulus: `<p style="margin-bottom:1.2em">${CONFIG.slider_prompt}</p>`,
-    labels: CONFIG.slider_labels, min: 0, max: 100, slider_start: 50, step: 1,
-    require_movement: true, button_label: 'Next',
-    data: { phase, block, condition_delay: cond.delay, condition_flash: cond.flash },
-  },
-]);
+  on_finish: () => { cancelAnimationFrame(paceRaf); },
+});
+
+// feedback after a stretch (v2). Shown only AFTER the agency rating, so it cannot colour that rating.
+function qualityProblems(tr) {
+  const q = CONFIG.qc, out = [];
+  if (tr.off_ring_frac !== null && tr.off_ring_frac > q.max_off_ring)
+    out.push('Try to keep your hand <b>on the grey ring</b> &mdash; not inside or outside it.');
+  if (tr.backward_frac !== null && tr.backward_frac > q.max_backward)
+    out.push('Keep going round <b>in one direction</b> the whole time.');
+  if (tr.laps_per_s !== null && tr.laps_per_s < q.min_laps_per_s)
+    out.push(`That was quite slow &mdash; aim for about one lap every ${CONFIG.pace_lap_s} seconds.`);
+  if (tr.laps_per_s !== null && tr.laps_per_s > q.max_laps_per_s)
+    out.push(`That was quite fast &mdash; slow down to about one lap every ${CONFIG.pace_lap_s} seconds.`);
+  return out;
+}
+const lastTrace = () => jsPsych.data.get().filter({ trial_type: 'circle-trace' }).last(1).values()[0];
+
+// one stretch = trace + rating (+ feedback if tracing was off target)
+let stretchCounter = 0;
+const stretch = (cond, phase, block) => {
+  const idx = phase === 'main' ? ++stretchCounter : null;   // 1..N within the main phase
+  const tags = { phase, block, stretch_index: idx, condition_delay: cond.delay, condition_flash: cond.flash };
+  const nodes = [
+    {
+      type: CircleTracePlugin,
+      delay_ms: cond.delay, flash: cond.flash,
+      duration_ms: CONFIG.stretch_ms, flash_ms: CONFIG.flash_ms, flash_window: CONFIG.flash_window_ms,
+      canvas_px: CONFIG.canvas_px, radius_px: CONFIG.ring_radius_px, dot_px: CONFIG.dot_radius_px,
+      ring_tol_px: CONFIG.qc.ring_tol_px,
+      data: tags,
+      on_finish: (d) => { d.qc_feedback = qualityProblems(d).length > 0; },
+    },
+    {
+      type: jsPsychHtmlSliderResponse,
+      stimulus: `<p style="margin-bottom:1.2em">${CONFIG.slider_prompt}</p>`,
+      labels: CONFIG.slider_labels, min: 0, max: 100, slider_start: 50, step: 1,
+      require_movement: true, button_label: 'Next',
+      data: tags,
+    },
+  ];
+  if (CONFIG.feedback) nodes.push({
+    timeline: [{
+      type: jsPsychHtmlButtonResponse,
+      stimulus: () => `<p><b>A quick note on your tracing</b></p>` +
+                      qualityProblems(lastTrace()).map(m => `<p>${m}</p>`).join(''),
+      choices: ['OK'],
+      data: { ...tags, phase: 'feedback' },
+    }],
+    conditional_function: () => qualityProblems(lastTrace()).length > 0,
+  });
+  return nodes;
+};
 
 // practice
 CONFIG.practice.forEach(c => timeline.push(...stretch(c, 'practice', 0)));
@@ -363,11 +492,18 @@ conds.forEach((c, i) => {
   timeline.push(...stretch(c, 'main', block));
 });
 
+// debrief (v2). The instructions already tell people the dot can lag, so a "did it lag?" question
+// carries no information; the attention check is whether the colour flash was noticed.
 timeline.push({ type: jsPsychHtmlButtonResponse,
-  stimulus: `<p>Last question. Did you notice anything unusual about the dot during the study?</p>
-             <p class="small">(This helps us know what people noticed; there is no right answer.)</p>`,
-  choices: ['Yes, the dot lagged', 'Yes, the dot changed colour', 'Yes, both', 'Nothing unusual'],
-  data: { phase: 'debrief' } });
+  stimulus: `<p>Did the dot ever <b>change colour</b> during the study?</p>`,
+  choices: ['Yes', 'No', 'Not sure'],
+  data: { phase: 'debrief', question: 'colour' },
+  on_finish: (d) => { d.answer = ['yes', 'no', 'not_sure'][d.response]; } });
+timeline.push({ type: jsPsychSurveyText,
+  questions: [{ prompt: 'Anything else you noticed about the dot, or about how the task felt? (optional)',
+                name: 'comment', rows: 3, columns: 50, required: false }],
+  button_label: 'Finish',
+  data: { phase: 'debrief', question: 'comment' } });
 
 jsPsych.run(timeline);
 </script>
