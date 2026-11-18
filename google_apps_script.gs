@@ -26,7 +26,7 @@
  *   A row is appended to _log.csv in the folder for every save (time, pid, final?, size).
  */
 
-var FOLDER_ID = 'PASTE_YOUR_DRIVE_FOLDER_ID_HERE';
+var FOLDER_ID = 'https://drive.google.com/drive/folders/1wZm4egyIvUwHRikEdlwBQyB-xhqAlZ10';
 
 function doGet(e) {
   return respond({ status: 'ok', message: 'receiver is up' });
