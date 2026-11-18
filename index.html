@@ -90,7 +90,7 @@ const CONFIG = {
   // ---- data saving ---------------------------------------------------------
   // Paste the Web App URL from google_apps_script.gs (Deploy -> Web app -> URL ending in /exec)
   save_url:         'https://script.google.com/macros/s/AKfycbzubpUd2_BUat8btQUgejGXg3tJoRKQy1cyL_GoO-vYEwAmSaTie7M0r75okx-ozlxA1Q/exec',
-  save:             URLP.get('save') !== 'off',   // ?save=off -> local download only
+  save:             URLP.get('save') !== 'on',   // ?save=off -> local download only
   study_tag:        'agency_tracing_v2',           // goes into every filename (v2 = this version)
 };
 if (DEV) { CONFIG.reps_per_delay = 1; CONFIG.n_flash_control = 1; CONFIG.n_blocks = 2;
